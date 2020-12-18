@@ -5,7 +5,7 @@ from tkinter import font as tkfont
 from tkinter.messagebox import showinfo
 from PIL import Image, ImageTk
 from enum import Enum
-import RPi.GPIO as IO
+from nano import EsdNano
 import os
 import cv2
 import math
@@ -19,18 +19,12 @@ import random
 import queue
 import threading
 
-# module attached
-IR_SENSOR_PIN = 5
-LIGHT_SENSOR_LEFT_PIN = 14
-LIGHT_SENSOR_RIGHT_PIN = 15
-GATE_RELAY_PIN = 18
-
 # main config
 DIR_NAME = os.path.dirname(os.path.abspath(__file__))
-API_URL = 'http://172.16.65.18:8989/api'
-MACHINE = 'ESD-[Station]'
+API_URL = 'http://vtnportal.spartronics.com/luxand/api'
+MACHINE = 'ESD-Mezzanine'
 REQUEST_TIMEOUT = 1 #seconds
-GATE_TIMEOUT = 7 #seconds
+GATE_TIMEOUT = 0.1 #seconds
 RECOGNIZE_TIMEOUT = 3 #seconds
 CAMERA_TIMEOUT = 300 #seconds
 BARCODE_SCAN_TIMEOUT = 10 #seconds
@@ -57,12 +51,6 @@ class App(tk.Tk):
 
     def __init__(self, *args, **kwargs):
         tk.Tk.__init__(self, *args, **kwargs)
-        IO.setwarnings(False)
-        IO.setmode(IO.BCM)
-        IO.setup(IR_SENSOR_PIN, IO.IN) #IR sensor
-        IO.setup(LIGHT_SENSOR_LEFT_PIN, IO.IN) #Left light sensor
-        IO.setup(LIGHT_SENSOR_RIGHT_PIN, IO.IN) #Right light sensor
-        IO.setup(GATE_RELAY_PIN, IO.OUT) #Gate relay
 
         self.user = { "username": None, "fullname": None, "gender": None, "date_of_birth": None }
         self.test_type = None
@@ -144,6 +132,11 @@ class MainPage(tk.Frame):
         self.controller = controller
         self.width = 900
         self.height = 600
+        # initialize integrated Arduino Nano in USB port 0
+        # check the port by command: dmesg | grep tty
+        self.nano = EsdNano('/dev/ttyUSB0')
+        if not self.nano.is_connected():
+            print("Connected failed to Nano!")
         # timer for turning on/off camera
         self.cam_timer = Timer(1)
         # timer for each request will be sent to the server
@@ -243,9 +236,7 @@ class MainPage(tk.Frame):
             self.canvas.rtimg = rtphoto
 
     def detect_motion(self):
-        if (IO.input(IR_SENSOR_PIN) == True):
-            self.open_camera()
-        self.close_gate()
+        self.open_camera()
         self.after(10, self.detect_motion)
 
     def open_camera(self, event=None):
@@ -316,11 +307,11 @@ class MainPage(tk.Frame):
     def open_gate(self):
         self.gate_timer.reset()
         self.is_gate_opened = True
-        IO.output(GATE_RELAY_PIN, 1)
+        # trigger the gate and automatically close when timeout
+        self.nano.trigger_gate(GATE_TIMEOUT)
 
     def close_gate(self):
         if (self.gate_timer.is_timeout() and self.is_gate_opened):
-            IO.output(GATE_RELAY_PIN, 0)
             self.is_gate_opened = False
 
     def authenticate(self, username):
@@ -356,9 +347,8 @@ class MainPage(tk.Frame):
         self.after(100, self.handle_barcode)
 
     def handle_esd_test(self):
-        # return 0 if sensor detected light
-        self.left_foot = not IO.input(LIGHT_SENSOR_LEFT_PIN)
-        self.right_foot = not IO.input(LIGHT_SENSOR_RIGHT_PIN)
+        self.left_foot = self.nano.read_left_foot()
+        self.right_foot = self.nano.read_right_foot()
 
         self.render_esd_result(True)
         if (self.controller.user["username"] is not None):
@@ -378,6 +368,7 @@ class MainPage(tk.Frame):
 
         # wait for testing ESD
         if (self.esd_timer.is_timeout()):
+            self.nano.end_test()
             self.esd_testing = False
             # record failed result
             self.save_result(self.controller.user["username"], self.controller.user["fullname"], self.controller.test_type, self.esd_timer.duration(), "failed")
@@ -404,7 +395,8 @@ class MainPage(tk.Frame):
         info_log.info("{0}({1}) - mode:{2} - duration:{3} - result:{4} - machine:{5}".format(data["username"], data["fullname"], data["type"], data["duration"], data["result"], data["machine"]))
         # save the result
         try:
-            requests.post(API_URL + '/esd/save', data, timeout=REQUEST_TIMEOUT)
+            #requests.post(API_URL + '/esd/save', data, timeout=REQUEST_TIMEOUT)
+            pass
         except:
             # local storage when save data to server failed
             self.save_file(data)
@@ -471,6 +463,9 @@ class MainPage(tk.Frame):
         self.handle_barcode()
 
     def test_esd(self):
+        # inform to Nano that begin testing ESD
+        # in order to check the result status
+        self.nano.begin_test()
         self.controller.mode = AppMode.ESD_TEST
         self.set_state_message()
         self.esd_timer.reset()
@@ -526,6 +521,9 @@ class MainPage(tk.Frame):
             except Exception as e:
                 print(e)
                 self.use_barcode()
+
+    def destroy(self):
+        self.nano.disconnect()
 
 class Timer():
 
