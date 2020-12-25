@@ -5,7 +5,6 @@ from tkinter import font as tkfont
 from tkinter.messagebox import showinfo
 from PIL import Image, ImageTk
 from enum import Enum
-import threading
 import RPi.GPIO as IO
 import os
 import cv2
@@ -17,6 +16,8 @@ import base64
 import time
 import datetime
 import random
+import queue
+import threading
 
 # module attached
 IR_SENSOR_PIN = 5
@@ -27,11 +28,11 @@ GATE_RELAY_PIN = 18
 # main config
 DIR_NAME = os.path.dirname(os.path.abspath(__file__))
 API_URL = 'http://172.16.65.18:8989/api'
-MACHINE = 'ESD-Mezzanine'
+MACHINE = 'ESD-[Station]'
 REQUEST_TIMEOUT = 1 #seconds
-GATE_TIMEOUT = 10 #seconds
+GATE_TIMEOUT = 7 #seconds
 RECOGNIZE_TIMEOUT = 3 #seconds
-CAMERA_TIMEOUT = 30 #seconds
+CAMERA_TIMEOUT = 300 #seconds
 BARCODE_SCAN_TIMEOUT = 10 #seconds
 ESD_TEST_TIMEOUT = 7 #seconds
 
@@ -59,7 +60,6 @@ class App(tk.Tk):
         IO.setwarnings(False)
         IO.setmode(IO.BCM)
         IO.setup(IR_SENSOR_PIN, IO.IN) #IR sensor
-        print(IR_SENSOR_PIN)
         IO.setup(LIGHT_SENSOR_LEFT_PIN, IO.IN) #Left light sensor
         IO.setup(LIGHT_SENSOR_RIGHT_PIN, IO.IN) #Right light sensor
         IO.setup(GATE_RELAY_PIN, IO.OUT) #Gate relay
@@ -74,6 +74,8 @@ class App(tk.Tk):
         self.title("GUI")
         self.geometry("900x600")
         self.wm_attributes("-fullscreen", "true")
+        # bind exit callback function
+        self.protocol("WM_DELETE_WINDOW", self.quit)
 
         # the container is where we'll stack a bunch of frames
         # on top of each other, then the one we want visible
@@ -119,12 +121,21 @@ class App(tk.Tk):
                 self.mode = AppMode.ESD_TEST
         except: pass
 
+    def quit(self):
+        self.mode = AppMode.QUIT
+        # destroy each frame first 
+        for frame in list(self.frames):
+            del self.frames[frame]
+        # destroy the app
+        self.destroy()
+
 class AppMode(Enum):
     IDLE = "ideal"
     MOTION_DETECT = "motion_detect"
     FACE_RECOGNIZE = "face_recognize"
     BARCODE_SCAN = "barcode_scan"
     ESD_TEST = "esd_test"
+    QUIT = "quit"
 
 class MainPage(tk.Frame):
 
@@ -149,8 +160,12 @@ class MainPage(tk.Frame):
         self.refresh_timer = Timer()
         # the timeout for opening the gate
         self.gate_timer = Timer(GATE_TIMEOUT)
+        # handle image queue
+        self.req_queue = queue.Queue()
+        # handle image thread
+        self.req_thread = threading.Thread(target=self.observe_req_queue)
         self.recognizing = False
-        self.data = { "title": "Welcome to Sparton VN", "message": "Chúc bạn một ngày làm việc vui vẻ!" }
+        self.data = { "title": "Welcome to Spartronics VN", "message": "Chúc bạn một ngày làm việc vui vẻ!" }
         self.camera_on = False
         self.left_foot = None
         self.right_foot = None
@@ -178,6 +193,7 @@ class MainPage(tk.Frame):
         #self.lbarcode.bind("<Button-1>", self.use_barcode)
         self.use_barcode()
         self.detect_motion()
+        self.req_thread.start()
 
     def render(self):
         width = self.width
@@ -206,6 +222,7 @@ class MainPage(tk.Frame):
     def render_esd_result(self, rendered):
         self.canvas.delete('rfoot')
         self.canvas.delete('lfoot')
+
         if rendered == True and self.controller.mode == AppMode.ESD_TEST and self.left_foot is not None and self.right_foot is not None:
             pic_w = 200
             pic_h = 100
@@ -226,7 +243,6 @@ class MainPage(tk.Frame):
             self.canvas.rtimg = rtphoto
 
     def detect_motion(self):
-        #print(IO.input(IR_SENSOR_PIN))
         if (IO.input(IR_SENSOR_PIN) == True):
             self.open_camera()
         self.close_gate()
@@ -410,7 +426,9 @@ class MainPage(tk.Frame):
         self.lmain.configure(image=imgtk)
         self.lmain.update()
 
-        self.handle_image(frame)
+        if self.req_queue.empty():
+            # put an function into queue, the function invokes handle method
+            self.req_queue.put(lambda: self.handle_image(frame))
 
         # close camera if no any faces detected
         if (self.face_timer.is_timeout()):
@@ -418,6 +436,20 @@ class MainPage(tk.Frame):
         # recall to stream video
         else:
             self.lmain.after(1, self.video_stream)
+
+    def observe_req_queue(self):
+        while True:
+            try:
+                if self.controller.mode == AppMode.QUIT:
+                    break
+                fn = self.req_queue.get()
+                fn()
+            except queue.Empty:
+                break
+
+        # observe the queue to handle until the application quit
+        if self.controller.mode != AppMode.QUIT:
+            self.lmain.after(100, self.observe_req_queue)
 
     def post_image(self, base64img):
         data = { "data": base64img }
@@ -449,7 +481,7 @@ class MainPage(tk.Frame):
         if (self.controller.mode != AppMode.ESD_TEST):
             try:
                 self.frame_count += 1
-                if (len(self.req_list) == 0 or self.frame_count % 3 == 0):
+                if (len(self.req_list) == 0 or self.frame_count % 2 == 0):
                     _, buf = cv2.imencode(".jpg", imgframe)
                     base64img = base64.b64encode(buf)
                     data = { "data": base64img }
@@ -457,7 +489,7 @@ class MainPage(tk.Frame):
                     self.frame_count = 0
 
                 # sent request to server every 0.5 seconds
-                if (self.dur_timer.is_timeout(0.5)):
+                if (self.dur_timer.is_timeout(0.1)):
                     # send image to server in order to detect face id
                     res = grequests.map(self.req_list, 10)
                     self.req_list.clear()
